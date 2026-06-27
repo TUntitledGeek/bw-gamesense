@@ -1,0 +1,10 @@
+[
+  {
+    "label": "Run focused Python file",
+    "command": "python \"$ZED_FILE\"",
+    "cwd": "$ZED_DIRNAME",
+    "save": "current",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+  },
+]

@@ -1,19 +1,20 @@
 import json
-import tkinter as tk
+import sys
 from dataclasses import fields, is_dataclass
 from pathlib import Path
-from tkinter import messagebox, ttk
 
 try:
-    import ttkbootstrap as ttkbootstrap_theme
-
-    USING_TTKBOOTSTRAP = True
+    from PySide6.QtCore import Property, QObject, QUrl, Signal, Slot
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtQml import QQmlApplicationEngine
+    from PySide6.QtQuickControls2 import QQuickStyle
 except ImportError:
-    ttkbootstrap_theme = None
-    USING_TTKBOOTSTRAP = False
+    print("PySide6 is not installed.")
+    print("Run this first:")
+    print("python -m pip install PySide6")
+    raise SystemExit(1)
 
 
-APP_THEME = "flatly"
 PLAYS_LIST_FILE = Path(__file__).with_name("plays_list.json")
 
 COMPARISON_OPTIONS = [
@@ -114,11 +115,37 @@ def load_plays_data():
     if not PLAYS_LIST_FILE.exists():
         return {"plays": []}
 
-    with open(PLAYS_LIST_FILE, "r", encoding="utf-8") as file:
-        loaded_data = json.load(file)
+    try:
+        with open(PLAYS_LIST_FILE, "r", encoding="utf-8") as file:
+            loaded_data = json.load(file)
+    except json.JSONDecodeError:
+        return {"plays": []}
 
-    if "plays" not in loaded_data:
+    if not isinstance(loaded_data, dict):
+        return {"plays": []}
+
+    if "plays" not in loaded_data or not isinstance(loaded_data["plays"], list):
         loaded_data["plays"] = []
+
+    for play in loaded_data["plays"]:
+        if not isinstance(play, dict):
+            continue
+
+        play.setdefault("name", "unnamed_play")
+        play.setdefault("base_score", 0)
+
+        if "rules" not in play or not isinstance(play["rules"], list):
+            play["rules"] = []
+
+        for rule in play["rules"]:
+            if not isinstance(rule, dict):
+                continue
+
+            rule.setdefault("path", "")
+            rule.setdefault("comparison", "")
+            rule.setdefault("value", "")
+            rule.setdefault("score_change", "")
+            rule.setdefault("reasoning", "")
 
     return loaded_data
 
@@ -129,7 +156,7 @@ def save_plays_data(plays_data):
 
 
 def parse_rule_value(value_text):
-    value_text = value_text.strip()
+    value_text = str(value_text).strip()
 
     if value_text == "":
         return ""
@@ -330,737 +357,240 @@ def load_path_options_from_placeholder_state():
         return fallback_paths, FALLBACK_PATH_TYPES.copy()
 
 
-class BWGSActionEditor:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("BWGS Play Editor")
-        self.root.geometry("1280x780")
-        self.root.minsize(1000, 650)
+class EditorBackend(QObject):
+    playsChanged = Signal()
+    pathsChanged = Signal()
+    statusChanged = Signal()
+    selectionChanged = Signal()
+
+    def __init__(self):
+        super().__init__()
 
         self.plays_data = load_plays_data()
         self.path_options, self.path_type_map = (
             load_path_options_from_placeholder_state()
         )
 
-        self.tree_item_info = {}
-        self.play_tree_items = {}
-        self.play_field_items = {}
-        self.rule_tree_items = {}
-        self.rule_field_items = {}
+        self.selected_play_index = -1
+        self.selected_rule_index = -1
+        self._status = f"Editing {PLAYS_LIST_FILE.name}"
 
-        self.selected_play_index = None
-        self.selected_rule_index = None
-        self.loading_form = False
-        self.active_floating_editor = None
+    def get_plays(self):
+        return self.plays_data.get("plays", [])
 
-        self.play_name_var = tk.StringVar()
-        self.play_base_score_var = tk.StringVar()
+    def get_path_options(self):
+        return self.path_options
 
-        self.rule_path_var = tk.StringVar()
-        self.rule_comparison_var = tk.StringVar()
-        self.rule_value_var = tk.StringVar()
-        self.rule_score_change_var = tk.StringVar()
-        self.rule_reasoning_var = tk.StringVar()
+    def get_status(self):
+        return self._status
 
-        self.setup_style()
-        self.build_layout()
-        self.connect_form_events()
-        self.refresh_tree()
+    def get_selected_play_index(self):
+        return self.selected_play_index
 
-    def setup_style(self):
-        style = ttk.Style()
+    def get_selected_rule_index(self):
+        return self.selected_rule_index
 
-        if not USING_TTKBOOTSTRAP:
-            try:
-                style.theme_use("clam")
-            except tk.TclError:
-                pass
+    def get_selection_mode(self):
+        if self.selected_rule_index >= 0:
+            return "rule"
 
-        style.configure("Treeview", rowheight=30, font=("TkDefaultFont", 10))
-        style.configure("Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
-        style.configure("Title.TLabel", font=("TkDefaultFont", 17, "bold"))
-        style.configure("Subtitle.TLabel", foreground="#6c757d")
-        style.configure("Hint.TLabel", foreground="#6c757d")
+        if self.selected_play_index >= 0:
+            return "play"
 
-    def build_layout(self):
-        main_frame = ttk.Frame(self.root, padding=14)
-        main_frame.pack(fill="both", expand=True)
+        return "none"
 
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(1, weight=1)
+    def get_selected_play_name(self):
+        play = self.get_selected_play()
 
-        top_bar = ttk.Frame(main_frame)
-        top_bar.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        if play is None:
+            return ""
 
-        title_area = ttk.Frame(top_bar)
-        title_area.pack(side="left")
+        return str(play.get("name", ""))
 
-        ttk.Label(title_area, text="BWGS Play Editor", style="Title.TLabel").pack(
-            anchor="w"
-        )
+    def get_selected_play_base_score(self):
+        play = self.get_selected_play()
 
-        ttk.Label(
-            title_area,
-            text="Edit Bedwars plays, score rules, paths, comparisons, and reasoning.",
-            style="Subtitle.TLabel",
-        ).pack(anchor="w")
+        if play is None:
+            return ""
 
-        ttk.Button(top_bar, text="Save", command=self.save_now).pack(
-            side="right",
-            padx=(8, 0),
-        )
+        return str(play.get("base_score", ""))
 
-        ttk.Button(top_bar, text="Reload Paths", command=self.reload_path_options).pack(
-            side="right",
-            padx=(8, 0),
-        )
+    def get_selected_rule_path(self):
+        rule = self.get_selected_rule()
 
-        ttk.Button(
-            top_bar,
-            text="Delete Selected",
-            command=self.delete_selected_item,
-        ).pack(side="right", padx=(8, 0))
+        if rule is None:
+            return ""
 
-        main_pane = ttk.PanedWindow(main_frame, orient="horizontal")
-        main_pane.grid(row=1, column=0, sticky="nsew")
+        return str(rule.get("path", ""))
 
-        tree_card = ttk.Frame(main_pane, padding=10)
-        editor_card = ttk.Frame(main_pane, padding=10)
+    def get_selected_rule_comparison(self):
+        rule = self.get_selected_rule()
 
-        main_pane.add(tree_card, weight=3)
-        main_pane.add(editor_card, weight=1)
+        if rule is None:
+            return ""
 
-        self.build_tree_area(tree_card)
-        self.build_side_editor(editor_card)
+        return str(rule.get("comparison", ""))
 
-        self.status_var = tk.StringVar(value=f"Editing {PLAYS_LIST_FILE.name}")
-        ttk.Label(main_frame, textvariable=self.status_var, style="Hint.TLabel").grid(
-            row=2,
-            column=0,
-            sticky="w",
-            pady=(10, 0),
-        )
+    def get_selected_rule_value(self):
+        rule = self.get_selected_rule()
 
-    def build_tree_area(self, tree_frame):
-        tree_frame.columnconfigure(0, weight=1)
-        tree_frame.rowconfigure(1, weight=1)
+        if rule is None:
+            return ""
 
-        section_header = ttk.Frame(tree_frame)
-        section_header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        return value_to_text(rule.get("value", ""))
 
-        ttk.Label(
-            section_header,
-            text="Existing Plays",
-            font=("TkDefaultFont", 12, "bold"),
-        ).pack(side="left")
+    def get_selected_rule_score_change(self):
+        rule = self.get_selected_rule()
 
-        ttk.Label(
-            section_header,
-            text="Double-click values to edit inline",
-            style="Hint.TLabel",
-        ).pack(side="right")
+        if rule is None:
+            return ""
 
-        self.plays_tree = ttk.Treeview(
-            tree_frame,
-            columns=("field", "value"),
-            show="tree headings",
-            selectmode="browse",
-        )
+        return str(rule.get("score_change", ""))
 
-        self.plays_tree.heading("#0", text="Play / Rule")
-        self.plays_tree.heading("field", text="Field")
-        self.plays_tree.heading("value", text="Value")
+    def get_selected_rule_reasoning(self):
+        rule = self.get_selected_rule()
 
-        self.plays_tree.column("#0", width=390, minwidth=270)
-        self.plays_tree.column("field", width=145, minwidth=110)
-        self.plays_tree.column("value", width=470, minwidth=250)
+        if rule is None:
+            return ""
 
-        self.plays_tree.tag_configure("play", background="#eaf2ff")
-        self.plays_tree.tag_configure("rule", background="#f8f9fa")
-        self.plays_tree.tag_configure("add_button", foreground="#198754")
-        self.plays_tree.tag_configure("field", foreground="#495057")
+        return str(rule.get("reasoning", ""))
 
-        y_scrollbar = ttk.Scrollbar(
-            tree_frame,
-            orient="vertical",
-            command=self.plays_tree.yview,
-        )
+    def get_selected_rule_title(self):
+        rule = self.get_selected_rule()
 
-        x_scrollbar = ttk.Scrollbar(
-            tree_frame,
-            orient="horizontal",
-            command=self.plays_tree.xview,
-        )
+        if rule is None:
+            return "No Rule Selected"
 
-        self.plays_tree.configure(
-            yscrollcommand=y_scrollbar.set,
-            xscrollcommand=x_scrollbar.set,
-        )
+        return make_rule_english(rule)
 
-        self.plays_tree.grid(row=1, column=0, sticky="nsew")
-        y_scrollbar.grid(row=1, column=1, sticky="ns")
-        x_scrollbar.grid(row=2, column=0, sticky="ew")
+    def get_selected_path_type(self):
+        path = self.get_selected_rule_path()
+        return self.get_path_type_name(path)
 
-        self.plays_tree.bind("<<TreeviewSelect>>", self.on_tree_selection_changed)
-        self.plays_tree.bind("<Double-1>", self.on_tree_double_click)
-        self.plays_tree.bind("<Delete>", self.delete_selected_item)
+    def get_selected_comparison_options(self):
+        return self.get_comparison_options_for_path(self.get_selected_rule_path())
 
-        ttk.Label(
-            tree_frame,
-            text="Enter saves text edits. Escape cancels. Dropdown edits save after choosing an option.",
-            style="Hint.TLabel",
-        ).grid(row=3, column=0, sticky="w", pady=(8, 0))
+    def get_selected_value_options(self):
+        return self.get_value_options_for_path(self.get_selected_rule_path())
 
-    def build_side_editor(self, editor_frame):
-        editor_frame.columnconfigure(0, weight=1)
+    def get_selected_value_index(self):
+        value_text = self.get_selected_rule_value().lower()
+        options = self.get_selected_value_options()
 
-        ttk.Label(
-            editor_frame,
-            text="Inspector",
-            font=("TkDefaultFont", 12, "bold"),
-        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+        try:
+            return options.index(value_text)
+        except ValueError:
+            return -1
 
-        play_outer_box = ttk.LabelFrame(editor_frame, text="Selected Play")
-        play_outer_box.grid(row=1, column=0, sticky="ew")
+    plays = Property("QVariantList", get_plays, notify=playsChanged)
+    pathOptions = Property("QStringList", get_path_options, notify=pathsChanged)
+    status = Property(str, get_status, notify=statusChanged)
 
-        play_box = ttk.Frame(play_outer_box, padding=10)
-        play_box.pack(fill="x", expand=True)
+    selectedPlayIndex = Property(int, get_selected_play_index, notify=selectionChanged)
+    selectedRuleIndex = Property(int, get_selected_rule_index, notify=selectionChanged)
+    selectionMode = Property(str, get_selection_mode, notify=selectionChanged)
 
-        play_box.columnconfigure(1, weight=1)
+    selectedPlayName = Property(str, get_selected_play_name, notify=selectionChanged)
+    selectedPlayBaseScore = Property(
+        str,
+        get_selected_play_base_score,
+        notify=selectionChanged,
+    )
 
-        ttk.Label(play_box, text="Name").grid(row=0, column=0, sticky="w")
-        self.play_name_entry = ttk.Entry(play_box, textvariable=self.play_name_var)
-        self.play_name_entry.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+    selectedRulePath = Property(str, get_selected_rule_path, notify=selectionChanged)
+    selectedRuleComparison = Property(
+        str,
+        get_selected_rule_comparison,
+        notify=selectionChanged,
+    )
+    selectedRuleValue = Property(str, get_selected_rule_value, notify=selectionChanged)
+    selectedRuleScoreChange = Property(
+        str,
+        get_selected_rule_score_change,
+        notify=selectionChanged,
+    )
+    selectedRuleReasoning = Property(
+        str,
+        get_selected_rule_reasoning,
+        notify=selectionChanged,
+    )
+    selectedRuleTitle = Property(str, get_selected_rule_title, notify=selectionChanged)
+    selectedPathType = Property(str, get_selected_path_type, notify=selectionChanged)
+    selectedComparisonOptions = Property(
+        "QStringList",
+        get_selected_comparison_options,
+        notify=selectionChanged,
+    )
+    selectedValueOptions = Property(
+        "QStringList",
+        get_selected_value_options,
+        notify=selectionChanged,
+    )
+    selectedValueIndex = Property(
+        int, get_selected_value_index, notify=selectionChanged
+    )
 
-        ttk.Label(play_box, text="Base").grid(row=1, column=0, sticky="w", pady=(8, 0))
-        self.play_base_score_entry = ttk.Entry(
-            play_box,
-            textvariable=self.play_base_score_var,
-            width=10,
-        )
-        self.play_base_score_entry.grid(
-            row=1,
-            column=1,
-            sticky="w",
-            padx=(8, 0),
-            pady=(8, 0),
-        )
+    def set_status(self, message):
+        self._status = message
+        self.statusChanged.emit()
 
-        ttk.Button(
-            play_box,
-            text="＋ Add Rule",
-            command=self.add_rule_to_selected_play,
-        ).grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(12, 0))
+    def save_and_refresh(self, message):
+        save_plays_data(self.plays_data)
+        self.set_status(message)
+        self.playsChanged.emit()
+        self.selectionChanged.emit()
 
-        rule_outer_box = ttk.LabelFrame(editor_frame, text="Rule Contents")
-        rule_outer_box.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+    def valid_play_index(self, play_index):
+        return 0 <= play_index < len(self.plays_data.get("plays", []))
 
-        rule_box = ttk.Frame(rule_outer_box, padding=10)
-        rule_box.pack(fill="x", expand=True)
+    def valid_rule_index(self, play_index, rule_index):
+        if not self.valid_play_index(play_index):
+            return False
 
-        rule_box.columnconfigure(0, weight=1)
+        rules = self.plays_data["plays"][play_index].get("rules", [])
+        return 0 <= rule_index < len(rules)
 
-        ttk.Label(rule_box, text="Path").grid(row=0, column=0, sticky="w")
-        self.rule_path_combo = ttk.Combobox(
-            rule_box,
-            textvariable=self.rule_path_var,
-            values=self.path_options,
-        )
-        self.rule_path_combo.grid(row=1, column=0, sticky="ew")
+    def get_selected_play(self):
+        if not self.valid_play_index(self.selected_play_index):
+            return None
 
-        ttk.Label(rule_box, text="Comparison").grid(
-            row=2,
-            column=0,
-            sticky="w",
-            pady=(8, 0),
-        )
-        self.rule_comparison_combo = ttk.Combobox(
-            rule_box,
-            textvariable=self.rule_comparison_var,
-            values=COMPARISON_OPTIONS,
-            state="readonly",
-        )
-        self.rule_comparison_combo.grid(row=3, column=0, sticky="ew")
+        return self.plays_data["plays"][self.selected_play_index]
 
-        ttk.Label(rule_box, text="Value").grid(row=4, column=0, sticky="w", pady=(8, 0))
-        self.rule_value_combo = ttk.Combobox(
-            rule_box,
-            textvariable=self.rule_value_var,
-            values=[],
-        )
-        self.rule_value_combo.grid(row=5, column=0, sticky="ew")
+    def get_selected_rule(self):
+        if not self.valid_rule_index(
+            self.selected_play_index, self.selected_rule_index
+        ):
+            return None
 
-        ttk.Label(rule_box, text="Score change").grid(
-            row=6,
-            column=0,
-            sticky="w",
-            pady=(8, 0),
-        )
-        self.rule_score_entry = ttk.Entry(
-            rule_box,
-            textvariable=self.rule_score_change_var,
-        )
-        self.rule_score_entry.grid(row=7, column=0, sticky="ew")
+        return self.plays_data["plays"][self.selected_play_index]["rules"][
+            self.selected_rule_index
+        ]
 
-        ttk.Label(rule_box, text="Reasoning").grid(
-            row=8,
-            column=0,
-            sticky="w",
-            pady=(8, 0),
-        )
-        self.rule_reasoning_entry = ttk.Entry(
-            rule_box,
-            textvariable=self.rule_reasoning_var,
-        )
-        self.rule_reasoning_entry.grid(row=9, column=0, sticky="ew")
-
-        ttk.Label(
-            editor_frame,
-            text="Comparison and value options adjust based on the selected path type.",
-            wraplength=310,
-            style="Hint.TLabel",
-        ).grid(row=3, column=0, sticky="ew", pady=(12, 0))
-
-    def connect_form_events(self):
-        self.play_name_var.trace_add("write", self.on_play_form_changed)
-        self.play_base_score_var.trace_add("write", self.on_play_form_changed)
-
-        self.rule_path_var.trace_add("write", self.on_rule_form_changed)
-        self.rule_comparison_var.trace_add("write", self.on_rule_form_changed)
-        self.rule_value_var.trace_add("write", self.on_rule_form_changed)
-        self.rule_score_change_var.trace_add("write", self.on_rule_form_changed)
-        self.rule_reasoning_var.trace_add("write", self.on_rule_form_changed)
-
-        self.rule_path_combo.bind("<KeyRelease>", self.update_path_autocomplete)
-
-    def get_path_type(self, path):
+    def get_path_type_name(self, path):
         if not path:
             return "unknown"
 
         return self.path_type_map.get(path, "unknown")
 
     def get_comparison_options_for_path(self, path):
-        path_type = self.get_path_type(path)
+        path_type = self.get_path_type_name(path)
         return COMPARISON_OPTIONS_BY_TYPE.get(path_type, COMPARISON_OPTIONS)
 
     def get_value_options_for_path(self, path):
-        path_type = self.get_path_type(path)
+        path_type = self.get_path_type_name(path)
         return VALUE_OPTIONS_BY_TYPE.get(path_type, [])
 
-    def update_rule_widgets_for_path(self, clean_invalid_values):
-        path = self.rule_path_var.get().strip()
-        path_type = self.get_path_type(path)
-
-        comparison_options = self.get_comparison_options_for_path(path)
-        self.rule_comparison_combo["values"] = comparison_options
-
-        value_options = self.get_value_options_for_path(path)
-        self.rule_value_combo["values"] = value_options
-
-        if path_type == "boolean":
-            self.rule_value_combo.configure(state="readonly")
-        else:
-            if self.selected_rule_index is not None:
-                self.rule_value_combo.configure(state="normal")
-
-        if not clean_invalid_values:
+    def clean_rule_if_needed(self, play_index, rule_index):
+        if not self.valid_rule_index(play_index, rule_index):
             return
 
-        self.loading_form = True
-
-        current_comparison = self.rule_comparison_var.get().strip()
-
-        if current_comparison and current_comparison not in comparison_options:
-            self.rule_comparison_var.set("")
-
-        if path_type == "boolean":
-            current_value = self.rule_value_var.get().strip().lower()
-
-            if current_value not in ["", "true", "false"]:
-                self.rule_value_var.set("")
-
-        self.loading_form = False
-
-    def update_path_autocomplete(self, event=None):
-        typed_text = self.rule_path_var.get().lower().strip()
-
-        if not typed_text:
-            self.rule_path_combo["values"] = self.path_options
-            return
-
-        matching_paths = [
-            path for path in self.path_options if typed_text in path.lower()
-        ]
-
-        self.rule_path_combo["values"] = matching_paths[:100]
-
-    def refresh_tree(self, selected_play_index=None, selected_rule_index=None):
-        self.tree_item_info = {}
-        self.play_tree_items = {}
-        self.play_field_items = {}
-        self.rule_tree_items = {}
-        self.rule_field_items = {}
-
-        for item in self.plays_tree.get_children():
-            self.plays_tree.delete(item)
-
-        item_to_select = None
-
-        for play_index, play in enumerate(self.plays_data.get("plays", [])):
-            play_item = self.plays_tree.insert(
-                "",
-                "end",
-                text=self.make_play_tree_title(play_index, play),
-                values=("play", f"base_score: {play.get('base_score', 0)}"),
-                open=True,
-                tags=("play",),
-            )
-
-            self.play_tree_items[play_index] = play_item
-            self.tree_item_info[play_item] = {
-                "type": "play",
-                "play_index": play_index,
-            }
-
-            if selected_play_index == play_index and selected_rule_index is None:
-                item_to_select = play_item
-
-            name_item = self.plays_tree.insert(
-                play_item,
-                "end",
-                text="Play Field",
-                values=("name", play.get("name", "")),
-                tags=("field",),
-            )
-
-            self.play_field_items[(play_index, "name")] = name_item
-            self.tree_item_info[name_item] = {
-                "type": "play_field",
-                "play_index": play_index,
-                "field": "name",
-            }
-
-            base_score_item = self.plays_tree.insert(
-                play_item,
-                "end",
-                text="Play Field",
-                values=("base_score", play.get("base_score", 0)),
-                tags=("field",),
-            )
-
-            self.play_field_items[(play_index, "base_score")] = base_score_item
-            self.tree_item_info[base_score_item] = {
-                "type": "play_field",
-                "play_index": play_index,
-                "field": "base_score",
-            }
-
-            for rule_index, rule in enumerate(play.get("rules", [])):
-                rule_item = self.plays_tree.insert(
-                    play_item,
-                    "end",
-                    text=self.make_rule_tree_title(rule_index, rule),
-                    values=("rule", rule.get("reasoning", "")),
-                    open=False,
-                    tags=("rule",),
-                )
-
-                self.rule_tree_items[(play_index, rule_index)] = rule_item
-                self.tree_item_info[rule_item] = {
-                    "type": "rule",
-                    "play_index": play_index,
-                    "rule_index": rule_index,
-                }
-
-                if (
-                    selected_play_index == play_index
-                    and selected_rule_index == rule_index
-                ):
-                    item_to_select = rule_item
-
-                for field_name in [
-                    "path",
-                    "comparison",
-                    "value",
-                    "score_change",
-                    "reasoning",
-                ]:
-                    field_item = self.plays_tree.insert(
-                        rule_item,
-                        "end",
-                        text="Rule Field",
-                        values=(field_name, value_to_text(rule.get(field_name, ""))),
-                        tags=("field",),
-                    )
-
-                    self.rule_field_items[(play_index, rule_index, field_name)] = (
-                        field_item
-                    )
-                    self.tree_item_info[field_item] = {
-                        "type": "rule_field",
-                        "play_index": play_index,
-                        "rule_index": rule_index,
-                        "field": field_name,
-                    }
-
-            add_rule_item = self.plays_tree.insert(
-                play_item,
-                "end",
-                text="＋ Add Rule",
-                values=("button", "Double-click to add an empty rule to this play"),
-                tags=("add_button",),
-            )
-
-            self.tree_item_info[add_rule_item] = {
-                "type": "add_rule_button",
-                "play_index": play_index,
-            }
-
-        add_play_item = self.plays_tree.insert(
-            "",
-            "end",
-            text="＋ Add Play",
-            values=("button", "Double-click to add a new placeholder play"),
-            tags=("add_button",),
-        )
-
-        self.tree_item_info[add_play_item] = {
-            "type": "add_play_button",
-        }
-
-        if item_to_select is not None:
-            self.plays_tree.selection_set(item_to_select)
-            self.plays_tree.focus(item_to_select)
-            self.plays_tree.see(item_to_select)
-
-    def make_play_tree_title(self, play_index, play):
-        play_name = play.get("name", "").strip()
-
-        if not play_name:
-            play_name = "unnamed"
-
-        return f"Play {play_index + 1} ({play_name})"
-
-    def make_rule_tree_title(self, rule_index, rule):
-        return f"Rule {rule_index + 1} ({make_rule_english(rule)})"
-
-    def on_tree_selection_changed(self, event=None):
-        selected_item = self.get_selected_tree_item()
-
-        if selected_item is None:
-            self.selected_play_index = None
-            self.selected_rule_index = None
-            self.load_selected_data_into_form()
-            return
-
-        item_info = self.tree_item_info.get(selected_item)
-
-        if item_info is None:
-            return
-
-        if item_info["type"] == "add_play_button":
-            self.selected_play_index = None
-            self.selected_rule_index = None
-            self.load_selected_data_into_form()
-            return
-
-        self.selected_play_index = item_info.get("play_index")
-
-        if item_info["type"] in ["rule", "rule_field"]:
-            self.selected_rule_index = item_info.get("rule_index")
-        else:
-            self.selected_rule_index = None
-
-        self.load_selected_data_into_form()
-
-    def on_tree_double_click(self, event):
-        selected_item = self.plays_tree.identify_row(event.y)
-        selected_column = self.plays_tree.identify_column(event.x)
-
-        if not selected_item:
-            return
-
-        item_info = self.tree_item_info.get(selected_item)
-
-        if item_info is None:
-            return
-
-        if item_info["type"] == "add_play_button":
-            self.add_play()
-            return
-
-        if item_info["type"] == "add_rule_button":
-            self.add_blank_rule_to_play(item_info["play_index"])
-            return
-
-        if selected_column == "#2" and item_info["type"] in [
-            "play_field",
-            "rule_field",
-        ]:
-            self.start_floating_edit(selected_item, selected_column)
-            return
-
-        if item_info["type"] in ["play", "play_field"]:
-            self.play_name_entry.focus_set()
-            self.play_name_entry.select_range(0, tk.END)
-            return
-
-        if item_info["type"] in ["rule", "rule_field"]:
-            self.rule_path_combo.focus_set()
-            return
-
-    def get_selected_tree_item(self):
-        selected_items = self.plays_tree.selection()
-
-        if not selected_items:
-            return None
-
-        return selected_items[0]
-
-    def get_rule_path_for_tree_item(self, item_info):
-        if item_info["type"] != "rule_field":
-            return ""
-
-        play_index = item_info["play_index"]
-        rule_index = item_info["rule_index"]
-
-        rule = self.plays_data["plays"][play_index]["rules"][rule_index]
-        return rule.get("path", "")
-
-    def start_floating_edit(self, selected_item, selected_column):
-        if self.active_floating_editor is not None:
-            self.active_floating_editor.destroy()
-            self.active_floating_editor = None
-
-        item_info = self.tree_item_info.get(selected_item)
-
-        if item_info is None:
-            return
-
-        field_name = item_info.get("field")
-
-        if field_name is None:
-            return
-
-        x, y, width, height = self.plays_tree.bbox(selected_item, selected_column)
-        old_value = self.plays_tree.set(selected_item, "value")
-
-        editor_is_dropdown = False
-
-        if field_name == "comparison":
-            path = self.get_rule_path_for_tree_item(item_info)
-            comparison_options = self.get_comparison_options_for_path(path)
-
-            editor = ttk.Combobox(
-                self.plays_tree,
-                values=comparison_options,
-                state="readonly",
-            )
-            editor.set(old_value)
-            editor_is_dropdown = True
-
-        elif field_name == "path":
-            editor = ttk.Combobox(
-                self.plays_tree,
-                values=self.path_options,
-            )
-            editor.set(old_value)
-            self.attach_inline_path_autocomplete(editor)
-            editor_is_dropdown = True
-
-        elif field_name == "value":
-            path = self.get_rule_path_for_tree_item(item_info)
-            path_type = self.get_path_type(path)
-
-            if path_type == "boolean":
-                editor = ttk.Combobox(
-                    self.plays_tree,
-                    values=["true", "false"],
-                    state="readonly",
-                )
-
-                if old_value.lower() in ["true", "false"]:
-                    editor.set(old_value.lower())
-                else:
-                    editor.set("")
-
-                editor_is_dropdown = True
-            else:
-                editor = ttk.Entry(self.plays_tree)
-                editor.insert(0, old_value)
-
-        else:
-            editor = ttk.Entry(self.plays_tree)
-            editor.insert(0, old_value)
-
-        editor.place(x=x, y=y, width=width, height=height)
-        editor.focus_set()
-
-        self.active_floating_editor = editor
-        edit_finished = {"value": False}
-
-        def finish_edit(event=None):
-            if edit_finished["value"]:
-                return
-
-            edit_finished["value"] = True
-            new_value_text = editor.get()
-            editor.destroy()
-            self.active_floating_editor = None
-
-            self.apply_floating_edit(
-                selected_item=selected_item,
-                new_value_text=new_value_text,
-            )
-
-        def cancel_edit(event=None):
-            if edit_finished["value"]:
-                return
-
-            edit_finished["value"] = True
-            editor.destroy()
-            self.active_floating_editor = None
-
-        editor.bind("<Return>", finish_edit)
-        editor.bind("<Escape>", cancel_edit)
-
-        if editor_is_dropdown:
-            editor.bind("<<ComboboxSelected>>", finish_edit)
-
-            def open_dropdown():
-                try:
-                    editor.event_generate("<Button-1>")
-                except tk.TclError:
-                    pass
-
-            self.root.after(100, open_dropdown)
-        else:
-            editor.bind("<FocusOut>", finish_edit)
-
-    def attach_inline_path_autocomplete(self, combo_box):
-        def update_options(event=None):
-            typed_text = combo_box.get().lower().strip()
-
-            if not typed_text:
-                combo_box["values"] = self.path_options
-                return
-
-            matching_paths = [
-                path for path in self.path_options if typed_text in path.lower()
-            ]
-
-            combo_box["values"] = matching_paths[:100]
-
-        combo_box.bind("<KeyRelease>", update_options)
-
-    def clean_rule_comparison_and_value_if_needed(self, play_index, rule_index):
         rule = self.plays_data["plays"][play_index]["rules"][rule_index]
 
         path = rule.get("path", "")
-        path_type = self.get_path_type(path)
+        path_type = self.get_path_type_name(path)
 
-        current_comparison = rule.get("comparison", "")
         allowed_comparisons = self.get_comparison_options_for_path(path)
+        current_comparison = rule.get("comparison", "")
 
         if current_comparison and current_comparison not in allowed_comparisons:
             rule["comparison"] = ""
@@ -1071,254 +601,32 @@ class BWGSActionEditor:
             if current_value not in ["", "true", "false"]:
                 rule["value"] = ""
 
-    def apply_floating_edit(self, selected_item, new_value_text):
-        item_info = self.tree_item_info.get(selected_item)
-
-        if item_info is None:
+    @Slot(int)
+    def selectPlay(self, play_index):
+        if not self.valid_play_index(play_index):
             return
 
-        item_type = item_info["type"]
-        field_name = item_info.get("field")
-        play_index = item_info.get("play_index")
+        self.selected_play_index = play_index
+        self.selected_rule_index = -1
+        self.selectionChanged.emit()
 
-        if item_type == "play_field":
-            if field_name == "base_score":
-                try:
-                    new_value = int(new_value_text.strip())
-                except ValueError:
-                    messagebox.showerror(
-                        "Invalid base score",
-                        "Base score must be a number.",
-                    )
-                    return
-            else:
-                new_value = new_value_text.strip()
-
-            self.plays_data["plays"][play_index][field_name] = new_value
-
-            self.save_silently()
-            self.refresh_tree(selected_play_index=play_index)
-            self.load_selected_data_into_form()
+    @Slot(int, int)
+    def selectRule(self, play_index, rule_index):
+        if not self.valid_rule_index(play_index, rule_index):
             return
 
-        if item_type == "rule_field":
-            rule_index = item_info["rule_index"]
+        self.selected_play_index = play_index
+        self.selected_rule_index = rule_index
+        self.selectionChanged.emit()
 
-            if field_name == "score_change":
-                try:
-                    new_value = int(new_value_text.strip() or "0")
-                except ValueError:
-                    messagebox.showerror(
-                        "Invalid score change",
-                        "Score change must be a number.",
-                    )
-                    return
+    @Slot()
+    def clearSelection(self):
+        self.selected_play_index = -1
+        self.selected_rule_index = -1
+        self.selectionChanged.emit()
 
-            elif field_name == "value":
-                new_value = parse_rule_value(new_value_text)
-
-            elif field_name == "comparison":
-                rule = self.plays_data["plays"][play_index]["rules"][rule_index]
-                path = rule.get("path", "")
-                allowed_comparisons = self.get_comparison_options_for_path(path)
-
-                if new_value_text and new_value_text not in allowed_comparisons:
-                    messagebox.showerror(
-                        "Invalid comparison",
-                        "That comparison does not make sense for this path.",
-                    )
-                    return
-
-                new_value = new_value_text.strip()
-
-            else:
-                new_value = new_value_text.strip()
-
-            self.plays_data["plays"][play_index]["rules"][rule_index][field_name] = (
-                new_value
-            )
-
-            if field_name == "path":
-                self.clean_rule_comparison_and_value_if_needed(play_index, rule_index)
-
-            self.save_silently()
-            self.refresh_tree(
-                selected_play_index=play_index,
-                selected_rule_index=rule_index,
-            )
-            self.load_selected_data_into_form()
-
-    def load_selected_data_into_form(self):
-        self.loading_form = True
-
-        if self.selected_play_index is None:
-            self.play_name_var.set("")
-            self.play_base_score_var.set("")
-            self.set_play_fields_enabled(False)
-        else:
-            selected_play = self.plays_data["plays"][self.selected_play_index]
-
-            self.set_play_fields_enabled(True)
-            self.play_name_var.set(selected_play.get("name", ""))
-            self.play_base_score_var.set(str(selected_play.get("base_score", 0)))
-
-        if self.selected_rule_index is None:
-            self.rule_path_var.set("")
-            self.rule_comparison_var.set("")
-            self.rule_value_var.set("")
-            self.rule_score_change_var.set("")
-            self.rule_reasoning_var.set("")
-            self.set_rule_fields_enabled(False)
-        else:
-            selected_rule = self.plays_data["plays"][self.selected_play_index]["rules"][
-                self.selected_rule_index
-            ]
-
-            self.set_rule_fields_enabled(True)
-
-            self.rule_path_var.set(selected_rule.get("path", ""))
-            self.update_rule_widgets_for_path(clean_invalid_values=False)
-
-            self.rule_comparison_var.set(selected_rule.get("comparison", ""))
-            self.rule_value_var.set(value_to_text(selected_rule.get("value", "")))
-            self.rule_score_change_var.set(str(selected_rule.get("score_change", "")))
-            self.rule_reasoning_var.set(selected_rule.get("reasoning", ""))
-
-            self.update_rule_widgets_for_path(clean_invalid_values=True)
-
-        self.loading_form = False
-
-    def set_play_fields_enabled(self, enabled):
-        state = "normal" if enabled else "disabled"
-
-        self.play_name_entry.configure(state=state)
-        self.play_base_score_entry.configure(state=state)
-
-    def set_rule_fields_enabled(self, enabled):
-        if enabled:
-            self.rule_path_combo.configure(state="normal")
-            self.rule_comparison_combo.configure(state="readonly")
-            self.rule_value_combo.configure(state="normal")
-            self.rule_score_entry.configure(state="normal")
-            self.rule_reasoning_entry.configure(state="normal")
-            self.update_rule_widgets_for_path(clean_invalid_values=False)
-        else:
-            self.rule_path_combo.configure(state="disabled")
-            self.rule_comparison_combo.configure(state="disabled")
-            self.rule_value_combo.configure(state="disabled")
-            self.rule_score_entry.configure(state="disabled")
-            self.rule_reasoning_entry.configure(state="disabled")
-
-    def on_play_form_changed(self, *args):
-        if self.loading_form:
-            return
-
-        if self.selected_play_index is None:
-            return
-
-        selected_play = self.plays_data["plays"][self.selected_play_index]
-
-        selected_play["name"] = self.play_name_var.get()
-
-        base_score_text = self.play_base_score_var.get().strip()
-
-        if base_score_text not in ["", "-"]:
-            try:
-                selected_play["base_score"] = int(base_score_text)
-            except ValueError:
-                self.status_var.set("Base score must be a number.")
-                return
-
-        self.update_play_tree_display(self.selected_play_index)
-        self.save_silently()
-
-    def on_rule_form_changed(self, *args):
-        if self.loading_form:
-            return
-
-        if self.selected_play_index is None or self.selected_rule_index is None:
-            return
-
-        self.update_rule_widgets_for_path(clean_invalid_values=True)
-
-        selected_rule = self.plays_data["plays"][self.selected_play_index]["rules"][
-            self.selected_rule_index
-        ]
-
-        selected_rule["path"] = self.rule_path_var.get()
-        selected_rule["comparison"] = self.rule_comparison_var.get()
-        selected_rule["value"] = parse_rule_value(self.rule_value_var.get())
-
-        score_change_text = self.rule_score_change_var.get().strip()
-
-        if score_change_text not in ["", "-"]:
-            try:
-                selected_rule["score_change"] = int(score_change_text)
-            except ValueError:
-                self.status_var.set("Score change must be a number.")
-                return
-        else:
-            selected_rule["score_change"] = ""
-
-        selected_rule["reasoning"] = self.rule_reasoning_var.get()
-
-        self.clean_rule_comparison_and_value_if_needed(
-            self.selected_play_index,
-            self.selected_rule_index,
-        )
-
-        self.update_rule_tree_display(
-            self.selected_play_index, self.selected_rule_index
-        )
-        self.save_silently()
-
-    def update_play_tree_display(self, play_index):
-        play = self.plays_data["plays"][play_index]
-
-        play_item = self.play_tree_items.get(play_index)
-
-        if play_item:
-            self.plays_tree.item(
-                play_item,
-                text=self.make_play_tree_title(play_index, play),
-                values=("play", f"base_score: {play.get('base_score', 0)}"),
-            )
-
-        name_item = self.play_field_items.get((play_index, "name"))
-
-        if name_item:
-            self.plays_tree.item(name_item, values=("name", play.get("name", "")))
-
-        base_score_item = self.play_field_items.get((play_index, "base_score"))
-
-        if base_score_item:
-            self.plays_tree.item(
-                base_score_item,
-                values=("base_score", play.get("base_score", 0)),
-            )
-
-    def update_rule_tree_display(self, play_index, rule_index):
-        rule = self.plays_data["plays"][play_index]["rules"][rule_index]
-
-        rule_item = self.rule_tree_items.get((play_index, rule_index))
-
-        if rule_item:
-            self.plays_tree.item(
-                rule_item,
-                text=self.make_rule_tree_title(rule_index, rule),
-                values=("rule", rule.get("reasoning", "")),
-            )
-
-        for field_name in ["path", "comparison", "value", "score_change", "reasoning"]:
-            field_item = self.rule_field_items.get((play_index, rule_index, field_name))
-
-            if field_item:
-                self.plays_tree.item(
-                    field_item,
-                    values=(field_name, value_to_text(rule.get(field_name, ""))),
-                )
-
-    def add_play(self):
+    @Slot(result=int)
+    def addPlay(self):
         new_play_number = len(self.plays_data["plays"]) + 1
 
         new_play = {
@@ -1328,26 +636,19 @@ class BWGSActionEditor:
         }
 
         self.plays_data["plays"].append(new_play)
-        new_play_index = len(self.plays_data["plays"]) - 1
 
-        self.save_silently()
-        self.refresh_tree(selected_play_index=new_play_index)
+        self.selected_play_index = len(self.plays_data["plays"]) - 1
+        self.selected_rule_index = -1
 
-        self.selected_play_index = new_play_index
-        self.selected_rule_index = None
-        self.load_selected_data_into_form()
+        self.save_and_refresh("Added new play.")
+        return self.selected_play_index
 
-        self.play_name_entry.focus_set()
-        self.play_name_entry.select_range(0, tk.END)
+    @Slot(int, result=int)
+    def addRule(self, play_index):
+        if not self.valid_play_index(play_index):
+            self.set_status("Select a valid play before adding a rule.")
+            return -1
 
-    def add_rule_to_selected_play(self):
-        if self.selected_play_index is None:
-            messagebox.showwarning("No play selected", "Select a play first.")
-            return
-
-        self.add_blank_rule_to_play(self.selected_play_index)
-
-    def add_blank_rule_to_play(self, play_index):
         new_rule = {
             "path": "",
             "comparison": "",
@@ -1358,112 +659,1148 @@ class BWGSActionEditor:
 
         self.plays_data["plays"][play_index]["rules"].append(new_rule)
 
-        new_rule_index = len(self.plays_data["plays"][play_index]["rules"]) - 1
-
-        self.save_silently()
-        self.refresh_tree(
-            selected_play_index=play_index,
-            selected_rule_index=new_rule_index,
-        )
-
         self.selected_play_index = play_index
-        self.selected_rule_index = new_rule_index
-        self.load_selected_data_into_form()
-
-        self.rule_path_combo.focus_set()
-
-    def delete_selected_item(self, event=None):
-        selected_item = self.get_selected_tree_item()
-
-        if selected_item is None:
-            messagebox.showwarning("Nothing selected", "Select a play or rule first.")
-            return
-
-        item_info = self.tree_item_info.get(selected_item)
-
-        if item_info is None:
-            return
-
-        if item_info["type"] == "add_play_button":
-            return
-
-        if item_info["type"] == "add_rule_button":
-            return
-
-        if item_info["type"] in ["rule", "rule_field"]:
-            self.delete_rule(
-                play_index=item_info["play_index"],
-                rule_index=item_info["rule_index"],
-            )
-            return
-
-        if item_info["type"] in ["play", "play_field"]:
-            self.delete_play(play_index=item_info["play_index"])
-            return
-
-    def delete_play(self, play_index):
-        play_name = self.plays_data["plays"][play_index].get("name", "")
-
-        confirmed = messagebox.askyesno(
-            "Delete play",
-            f"Delete the whole play '{play_name}'?",
+        self.selected_rule_index = (
+            len(self.plays_data["plays"][play_index]["rules"]) - 1
         )
 
-        if not confirmed:
+        self.save_and_refresh("Added empty rule.")
+        return self.selected_rule_index
+
+    @Slot()
+    def addRuleToSelectedPlay(self):
+        if not self.valid_play_index(self.selected_play_index):
+            self.set_status("Select a play before adding a rule.")
             return
 
+        self.addRule(self.selected_play_index)
+
+    @Slot()
+    def deleteSelected(self):
+        if self.selected_rule_index >= 0:
+            self.deleteRule(self.selected_play_index, self.selected_rule_index)
+            return
+
+        if self.selected_play_index >= 0:
+            self.deletePlay(self.selected_play_index)
+
+    @Slot(int)
+    def deletePlay(self, play_index):
+        if not self.valid_play_index(play_index):
+            return
+
+        play_name = self.plays_data["plays"][play_index].get("name", "unnamed")
         del self.plays_data["plays"][play_index]
 
-        self.selected_play_index = None
-        self.selected_rule_index = None
+        if not self.plays_data["plays"]:
+            self.selected_play_index = -1
+            self.selected_rule_index = -1
+        else:
+            self.selected_play_index = min(
+                play_index, len(self.plays_data["plays"]) - 1
+            )
+            self.selected_rule_index = -1
 
-        self.save_silently()
-        self.refresh_tree()
-        self.load_selected_data_into_form()
+        self.save_and_refresh(f"Deleted play: {play_name}")
 
-    def delete_rule(self, play_index, rule_index):
-        confirmed = messagebox.askyesno(
-            "Delete rule",
-            f"Delete rule {rule_index + 1} from this play?",
-        )
-
-        if not confirmed:
+    @Slot(int, int)
+    def deleteRule(self, play_index, rule_index):
+        if not self.valid_rule_index(play_index, rule_index):
             return
 
         del self.plays_data["plays"][play_index]["rules"][rule_index]
 
-        self.selected_rule_index = None
+        self.selected_play_index = play_index
+        self.selected_rule_index = -1
 
-        self.save_silently()
-        self.refresh_tree(selected_play_index=play_index)
-        self.load_selected_data_into_form()
+        self.save_and_refresh("Deleted rule.")
 
-    def reload_path_options(self):
+    @Slot(str, str)
+    def updateSelectedPlayField(self, field_name, new_value):
+        self.updatePlayField(self.selected_play_index, field_name, new_value)
+
+    @Slot(str, str)
+    def updateSelectedRuleField(self, field_name, new_value):
+        self.updateRuleField(
+            self.selected_play_index,
+            self.selected_rule_index,
+            field_name,
+            new_value,
+        )
+
+    @Slot(int, str, str)
+    def updatePlayField(self, play_index, field_name, new_value):
+        if not self.valid_play_index(play_index):
+            return
+
+        play = self.plays_data["plays"][play_index]
+        new_value = str(new_value).strip()
+
+        if field_name == "name":
+            play["name"] = new_value
+
+        elif field_name == "base_score":
+            if new_value in ["", "-"]:
+                play["base_score"] = ""
+            else:
+                try:
+                    play["base_score"] = int(new_value)
+                except ValueError:
+                    self.set_status("Base score must be a number.")
+                    return
+
+        self.save_and_refresh("Updated play.")
+
+    @Slot(int, int, str, str)
+    def updateRuleField(self, play_index, rule_index, field_name, new_value):
+        if not self.valid_rule_index(play_index, rule_index):
+            return
+
+        rule = self.plays_data["plays"][play_index]["rules"][rule_index]
+        new_value = str(new_value).strip()
+
+        if field_name == "path":
+            rule["path"] = new_value
+            self.clean_rule_if_needed(play_index, rule_index)
+
+        elif field_name == "comparison":
+            allowed_comparisons = self.get_comparison_options_for_path(
+                rule.get("path", "")
+            )
+
+            if new_value and new_value not in allowed_comparisons:
+                self.set_status("That comparison does not match this path type.")
+                return
+
+            rule["comparison"] = new_value
+
+        elif field_name == "value":
+            rule["value"] = parse_rule_value(new_value)
+            self.clean_rule_if_needed(play_index, rule_index)
+
+        elif field_name == "score_change":
+            if new_value in ["", "-"]:
+                rule["score_change"] = ""
+            else:
+                try:
+                    rule["score_change"] = int(new_value)
+                except ValueError:
+                    self.set_status("Score change must be a number.")
+                    return
+
+        elif field_name == "reasoning":
+            rule["reasoning"] = new_value
+
+        self.save_and_refresh("Updated rule.")
+
+    @Slot()
+    def saveNow(self):
+        save_plays_data(self.plays_data)
+        self.set_status(f"Saved to {PLAYS_LIST_FILE.name}")
+        self.playsChanged.emit()
+        self.selectionChanged.emit()
+
+    @Slot()
+    def reloadPaths(self):
         self.path_options, self.path_type_map = (
             load_path_options_from_placeholder_state()
         )
-        self.rule_path_combo["values"] = self.path_options
-        self.update_rule_widgets_for_path(clean_invalid_values=True)
+        self.pathsChanged.emit()
+        self.playsChanged.emit()
+        self.selectionChanged.emit()
+        self.set_status(f"Reloaded {len(self.path_options)} path options.")
 
-        self.status_var.set(f"Reloaded {len(self.path_options)} path options.")
+    @Slot(str, result=int)
+    def pathIndex(self, path):
+        try:
+            return self.path_options.index(path)
+        except ValueError:
+            return -1
 
-    def save_silently(self):
-        save_plays_data(self.plays_data)
-        self.status_var.set(f"Saved to {PLAYS_LIST_FILE.name}")
+    @Slot(str, str, result=int)
+    def comparisonIndex(self, path, comparison):
+        options = self.get_comparison_options_for_path(path)
 
-    def save_now(self):
-        save_plays_data(self.plays_data)
-        messagebox.showinfo("Saved", f"Saved to {PLAYS_LIST_FILE.name}.")
+        try:
+            return options.index(comparison)
+        except ValueError:
+            return -1
+
+    @Slot(int, result=str)
+    def playTitle(self, play_index):
+        if not self.valid_play_index(play_index):
+            return "Play"
+
+        play = self.plays_data["plays"][play_index]
+        play_name = str(play.get("name", "")).strip()
+
+        if not play_name:
+            play_name = "unnamed"
+
+        return f"Play {play_index + 1} ({play_name})"
+
+    @Slot(int, int, result=str)
+    def ruleTitle(self, play_index, rule_index):
+        if not self.valid_rule_index(play_index, rule_index):
+            return "Rule"
+
+        rule = self.plays_data["plays"][play_index]["rules"][rule_index]
+        return make_rule_english(rule)
+
+    @Slot(int, int, result=str)
+    def ruleScoreText(self, play_index, rule_index):
+        if not self.valid_rule_index(play_index, rule_index):
+            return ""
+
+        rule = self.plays_data["plays"][play_index]["rules"][rule_index]
+        score_change = rule.get("score_change", "")
+
+        if score_change == "":
+            return "score ?"
+
+        try:
+            score_number = int(score_change)
+        except (TypeError, ValueError):
+            return "score ?"
+
+        return f"{score_number:+}"
+
+    @Slot(int, int, result=str)
+    def rulePathType(self, play_index, rule_index):
+        if not self.valid_rule_index(play_index, rule_index):
+            return "unknown"
+
+        rule = self.plays_data["plays"][play_index]["rules"][rule_index]
+        return self.get_path_type_name(rule.get("path", ""))
 
 
-def make_root_window():
-    if USING_TTKBOOTSTRAP:
-        return ttkbootstrap_theme.Window(themename=APP_THEME)
+QML_SOURCE = r"""
+import QtQuick
+import QtQuick.Controls
+import QtQuick.Layouts
+import QtQuick.Controls.Material
 
-    return tk.Tk()
+ApplicationWindow {
+    id: appWindow
+
+    width: 1240
+    height: 780
+    minimumWidth: 1040
+    minimumHeight: 680
+
+    visible: true
+    title: "BWGS Play Editor"
+
+    color: "#f4efe6"
+
+    Material.theme: Material.Light
+    Material.accent: "#b7791f"
+    Material.primary: "#b7791f"
+
+    readonly property color bgColor: "#f4efe6"
+    readonly property color panelColor: "#fffaf2"
+    readonly property color panelAltColor: "#fdf6ea"
+    readonly property color cardColor: "#ffffff"
+    readonly property color cardHover: "#f6ecd8"
+    readonly property color ruleRowColor: "#faf3e7"
+    readonly property color selectedColor: "#e7f5eb"
+    readonly property color selectedRuleColor: "#d9f2e1"
+
+    readonly property color borderColor: "#cdbfaa"
+    readonly property color strongBorderColor: "#b9a98f"
+    readonly property color softBorderColor: "#e0d4c2"
+
+    readonly property color textColor: "#231f1a"
+    readonly property color mutedText: "#74695b"
+
+    readonly property color buttonAccentColor: "#b7791f"
+    readonly property color buttonAccentHover: "#9a6419"
+    readonly property color greenActionColor: "#168a43"
+    readonly property color greenActionHover: "#e5f6eb"
+
+    readonly property color dangerColor: "#c2410c"
+    readonly property color warningColor: "#a16207"
+
+    Rectangle {
+        anchors.fill: parent
+        color: bgColor
+    }
+
+    ColumnLayout {
+        anchors.fill: parent
+        anchors.margins: 14
+        spacing: 10
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 10
+
+            Rectangle {
+                width: 40
+                height: 40
+                radius: 9
+                color: buttonAccentColor
+
+                Text {
+                    anchors.centerIn: parent
+                    text: "BW"
+                    color: "white"
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+
+                Text {
+                    text: "BWGS Play Editor"
+                    color: textColor
+                    font.pixelSize: 23
+                    font.bold: true
+                }
+
+                Text {
+                    text: "Compact rule editor for Bedwars GameSense scoring"
+                    color: mutedText
+                    font.pixelSize: 12
+                }
+            }
+
+            Rectangle {
+                radius: 8
+                color: panelColor
+                border.color: borderColor
+                border.width: 1
+                height: 30
+                width: Math.min(390, statusText.implicitWidth + 22)
+
+                Text {
+                    id: statusText
+                    anchors.centerIn: parent
+                    text: backend.status
+                    color: mutedText
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
+                    width: parent.width - 18
+                }
+            }
+
+            Button {
+                text: "Reload Paths"
+                flat: true
+                Material.foreground: mutedText
+                onClicked: backend.reloadPaths()
+            }
+
+            Button {
+                text: "Save"
+                highlighted: true
+                Material.accent: buttonAccentColor
+                onClicked: backend.saveNow()
+            }
+        }
+
+        SplitView {
+            Layout.fillWidth: true
+            Layout.fillHeight: true
+            orientation: Qt.Horizontal
+
+            handle: Rectangle {
+                implicitWidth: 8
+                color: "transparent"
+
+                Rectangle {
+                    anchors.centerIn: parent
+                    width: 1
+                    height: parent.height
+                    color: strongBorderColor
+                }
+            }
+
+            Rectangle {
+                id: listPanel
+
+                SplitView.preferredWidth: 790
+                SplitView.minimumWidth: 560
+                SplitView.fillWidth: true
+
+                radius: 10
+                color: panelColor
+                border.color: strongBorderColor
+                border.width: 1
+                clip: true
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 9
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+
+                            Text {
+                                text: "Existing Plays"
+                                color: textColor
+                                font.pixelSize: 18
+                                font.bold: true
+                            }
+
+                            Text {
+                                text: "Select a play or rule, then edit it in the right inspector."
+                                color: mutedText
+                                font.pixelSize: 11
+                            }
+                        }
+
+                        Button {
+                            text: "+ Add Play"
+                            highlighted: true
+                            Material.accent: buttonAccentColor
+                            onClicked: backend.addPlay()
+                        }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        height: 1
+                        color: softBorderColor
+                    }
+
+                    ScrollView {
+                        id: playsScroll
+
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+
+                        clip: true
+                        ScrollBar.vertical.policy: ScrollBar.AsNeeded
+                        ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+
+                        Column {
+                            id: playsColumn
+
+                            width: playsScroll.availableWidth
+                            spacing: 8
+
+                            Repeater {
+                                model: backend.plays
+
+                                delegate: PlayNode {
+                                    width: playsColumn.width
+                                    playIndex: index
+                                    playData: modelData
+                                }
+                            }
+
+                            Rectangle {
+                                width: playsColumn.width
+                                height: 46
+                                radius: 8
+                                color: addPlayMouse.containsMouse ? greenActionHover : panelAltColor
+                                border.color: addPlayMouse.containsMouse ? greenActionColor : softBorderColor
+                                border.width: 1
+
+                                Row {
+                                    anchors.centerIn: parent
+                                    spacing: 7
+
+                                    Text {
+                                        text: "+"
+                                        color: greenActionColor
+                                        font.pixelSize: 20
+                                        font.bold: true
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+
+                                    Text {
+                                        text: "Add Play"
+                                        color: greenActionColor
+                                        font.pixelSize: 13
+                                        font.bold: true
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+                                }
+
+                                MouseArea {
+                                    id: addPlayMouse
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: backend.addPlay()
+                                }
+                            }
+
+                            Item {
+                                width: 1
+                                height: 6
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                id: inspectorPanel
+
+                SplitView.preferredWidth: 390
+                SplitView.minimumWidth: 350
+                SplitView.maximumWidth: 500
+
+                radius: 10
+                color: panelAltColor
+                border.color: strongBorderColor
+                border.width: 1
+                clip: true
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 10
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        ColumnLayout {
+                            Layout.fillWidth: true
+                            spacing: 0
+
+                            Text {
+                                text: "Inspector"
+                                color: textColor
+                                font.pixelSize: 18
+                                font.bold: true
+                            }
+
+                            Text {
+                                text: backend.selectionMode === "rule"
+                                    ? "Editing selected rule"
+                                    : backend.selectionMode === "play"
+                                        ? "Editing selected play"
+                                        : "Nothing selected"
+                                color: mutedText
+                                font.pixelSize: 11
+                            }
+                        }
+
+                        Button {
+                            visible: backend.selectionMode !== "none"
+                            text: "Delete"
+                            flat: true
+                            Material.foreground: dangerColor
+                            onClicked: backend.deleteSelected()
+                        }
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        height: 1
+                        color: borderColor
+                    }
+
+                    Loader {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+
+                        sourceComponent: backend.selectionMode === "rule"
+                            ? ruleInspector
+                            : backend.selectionMode === "play"
+                                ? playInspector
+                                : emptyInspector
+                    }
+                }
+            }
+        }
+    }
+
+    component InspectorLabel: Text {
+        color: mutedText
+        font.pixelSize: 10
+        font.bold: true
+    }
+
+    component InspectorField: ColumnLayout {
+        property string labelText: ""
+
+        spacing: 4
+
+        InspectorLabel {
+            text: labelText
+        }
+    }
+
+    component InfoPill: Rectangle {
+        property string pillText: ""
+        property color pillColor: "#fffaf2"
+        property color pillTextColor: mutedText
+
+        radius: 7
+        color: pillColor
+        border.color: borderColor
+        border.width: 1
+        height: 24
+        width: pillLabel.implicitWidth + 18
+
+        Text {
+            id: pillLabel
+            anchors.centerIn: parent
+            text: pillText
+            color: pillTextColor
+            font.pixelSize: 10
+            font.bold: true
+        }
+    }
+
+    component EmptyCard: Rectangle {
+        Layout.fillWidth: true
+        radius: 9
+        color: cardColor
+        border.color: borderColor
+        border.width: 1
+    }
+
+    component PlayNode: Rectangle {
+        id: playNode
+
+        property int playIndex: -1
+        property var playData: ({})
+        property bool expanded: true
+        property bool selected: backend.selectionMode === "play"
+            && backend.selectedPlayIndex === playIndex
+
+        radius: 9
+        color: selected ? selectedColor : playMouse.containsMouse ? cardHover : cardColor
+        border.color: selected ? greenActionColor : borderColor
+        border.width: selected ? 2 : 1
+
+        height: nodeContent.implicitHeight + 18
+
+        MouseArea {
+            id: playMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: backend.selectPlay(playNode.playIndex)
+        }
+
+        ColumnLayout {
+            id: nodeContent
+
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: 9
+            spacing: 6
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 7
+
+                Button {
+                    Layout.preferredWidth: 32
+                    Layout.preferredHeight: 28
+                    text: playNode.expanded ? "▾" : "▸"
+                    flat: true
+                    Material.foreground: mutedText
+                    onClicked: playNode.expanded = !playNode.expanded
+                }
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 0
+
+                    Text {
+                        text: backend.playTitle(playNode.playIndex)
+                        color: textColor
+                        font.pixelSize: 14
+                        font.bold: true
+                        elide: Text.ElideRight
+                        Layout.fillWidth: true
+                    }
+
+                    Text {
+                        text: (playData.rules ? playData.rules.length : 0) + " rules"
+                        color: mutedText
+                        font.pixelSize: 10
+                    }
+                }
+
+                InfoPill {
+                    pillText: "base " + (playData.base_score === undefined ? 0 : playData.base_score)
+                    pillColor: "#fff7e8"
+                }
+
+                Button {
+                    text: "+ Rule"
+                    flat: true
+                    Material.foreground: buttonAccentColor
+                    onClicked: backend.addRule(playNode.playIndex)
+                }
+            }
+
+            Column {
+                visible: playNode.expanded
+                Layout.fillWidth: true
+                spacing: 5
+
+                Repeater {
+                    model: playData.rules ? playData.rules.length : 0
+
+                    delegate: RuleNode {
+                        width: parent.width
+                        playIndex: playNode.playIndex
+                        ruleIndex: index
+                        ruleData: playData.rules[index]
+                    }
+                }
+
+                Rectangle {
+                    width: parent.width
+                    height: 34
+                    radius: 8
+                    color: addRuleMouse.containsMouse ? greenActionHover : panelAltColor
+                    border.color: addRuleMouse.containsMouse ? greenActionColor : softBorderColor
+                    border.width: 1
+
+                    Text {
+                        anchors.centerIn: parent
+                        text: "+ Add Rule"
+                        color: greenActionColor
+                        font.pixelSize: 12
+                        font.bold: true
+                    }
+
+                    MouseArea {
+                        id: addRuleMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: backend.addRule(playNode.playIndex)
+                    }
+                }
+            }
+        }
+    }
+
+    component RuleNode: Rectangle {
+        id: ruleNode
+
+        property int playIndex: -1
+        property int ruleIndex: -1
+        property var ruleData: ({})
+        property bool selected: backend.selectionMode === "rule"
+            && backend.selectedPlayIndex === playIndex
+            && backend.selectedRuleIndex === ruleIndex
+
+        radius: 8
+        color: selected ? selectedRuleColor : ruleMouse.containsMouse ? "#f6ecd8" : ruleRowColor
+        border.color: selected ? greenActionColor : softBorderColor
+        border.width: selected ? 2 : 1
+
+        height: 44
+
+        MouseArea {
+            id: ruleMouse
+            anchors.fill: parent
+            hoverEnabled: true
+            cursorShape: Qt.PointingHandCursor
+            onClicked: backend.selectRule(ruleNode.playIndex, ruleNode.ruleIndex)
+        }
+
+        RowLayout {
+            anchors.fill: parent
+            anchors.leftMargin: 10
+            anchors.rightMargin: 8
+            spacing: 8
+
+            Rectangle {
+                width: 24
+                height: 24
+                radius: 6
+                color: selected ? greenActionColor : "#fffaf2"
+                border.color: selected ? greenActionColor : borderColor
+                border.width: 1
+
+                Text {
+                    anchors.centerIn: parent
+                    text: ruleNode.ruleIndex + 1
+                    color: selected ? "white" : mutedText
+                    font.pixelSize: 11
+                    font.bold: true
+                }
+            }
+
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 0
+
+                Text {
+                    text: backend.ruleTitle(ruleNode.playIndex, ruleNode.ruleIndex)
+                    color: textColor
+                    font.pixelSize: 12
+                    font.bold: true
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+
+                Text {
+                    text: ruleData.reasoning || "No reasoning yet"
+                    color: mutedText
+                    font.pixelSize: 10
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+            }
+
+            InfoPill {
+                pillText: backend.rulePathType(ruleNode.playIndex, ruleNode.ruleIndex)
+                pillColor: "#fffaf2"
+            }
+
+            InfoPill {
+                pillText: backend.ruleScoreText(ruleNode.playIndex, ruleNode.ruleIndex)
+                pillColor: "#fff7e8"
+                pillTextColor: warningColor
+            }
+        }
+    }
+
+    Component {
+        id: emptyInspector
+
+        ColumnLayout {
+            spacing: 10
+
+            EmptyCard {
+                implicitHeight: 165
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 8
+
+                    Text {
+                        text: "Select something to edit"
+                        color: textColor
+                        font.pixelSize: 16
+                        font.bold: true
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Choose a play or rule from the left panel. The compact editor will appear here."
+                        color: mutedText
+                        font.pixelSize: 12
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Button {
+                        text: "+ Add Play"
+                        highlighted: true
+                        Material.accent: buttonAccentColor
+                        onClicked: backend.addPlay()
+                    }
+                }
+            }
+        }
+    }
+
+    Component {
+        id: playInspector
+
+        ColumnLayout {
+            spacing: 10
+
+            EmptyCard {
+                implicitHeight: playInspectorContent.implicitHeight + 24
+
+                ColumnLayout {
+                    id: playInspectorContent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 12
+                    spacing: 10
+
+                    Text {
+                        text: "Selected Play"
+                        color: textColor
+                        font.pixelSize: 16
+                        font.bold: true
+                    }
+
+                    InspectorField {
+                        labelText: "NAME"
+                        Layout.fillWidth: true
+
+                        TextField {
+                            Layout.fillWidth: true
+                            text: backend.selectedPlayName
+                            placeholderText: "first_rush"
+                            selectByMouse: true
+
+                            onEditingFinished: {
+                                backend.updateSelectedPlayField("name", text)
+                            }
+                        }
+                    }
+
+                    InspectorField {
+                        labelText: "BASE SCORE"
+                        Layout.fillWidth: true
+
+                        TextField {
+                            Layout.fillWidth: true
+                            text: backend.selectedPlayBaseScore
+                            placeholderText: "0"
+                            selectByMouse: true
+
+                            onEditingFinished: {
+                                backend.updateSelectedPlayField("base_score", text)
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        Button {
+                            text: "+ Add Rule"
+                            highlighted: true
+                            Material.accent: buttonAccentColor
+                            onClicked: backend.addRuleToSelectedPlay()
+                        }
+
+                        Item {
+                            Layout.fillWidth: true
+                        }
+
+                        Button {
+                            text: "Delete Play"
+                            flat: true
+                            Material.foreground: dangerColor
+                            onClicked: backend.deleteSelected()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Component {
+        id: ruleInspector
+
+        ColumnLayout {
+            spacing: 10
+
+            EmptyCard {
+                implicitHeight: ruleInspectorContent.implicitHeight + 24
+
+                ColumnLayout {
+                    id: ruleInspectorContent
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: 12
+                    spacing: 10
+
+                    Text {
+                        text: "Selected Rule"
+                        color: textColor
+                        font.pixelSize: 16
+                        font.bold: true
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: backend.selectedRuleTitle
+                        color: mutedText
+                        font.pixelSize: 11
+                        wrapMode: Text.WordWrap
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        InfoPill {
+                            pillText: "type: " + backend.selectedPathType
+                            pillTextColor: greenActionColor
+                            pillColor: "#f0f8ef"
+                        }
+
+                        InfoPill {
+                            pillText: backend.selectedRuleScoreChange === ""
+                                ? "score ?"
+                                : "score " + backend.selectedRuleScoreChange
+                            pillTextColor: warningColor
+                            pillColor: "#fff7e8"
+                        }
+
+                        Item {
+                            Layout.fillWidth: true
+                        }
+                    }
+
+                    InspectorField {
+                        labelText: "PATH"
+                        Layout.fillWidth: true
+
+                        ComboBox {
+                            Layout.fillWidth: true
+                            editable: true
+                            model: backend.pathOptions
+                            currentIndex: backend.pathIndex(backend.selectedRulePath)
+
+                            onActivated: {
+                                backend.updateSelectedRuleField("path", currentText)
+                            }
+
+                            onAccepted: {
+                                backend.updateSelectedRuleField("path", editText)
+                            }
+                        }
+                    }
+
+                    InspectorField {
+                        labelText: "COMPARISON"
+                        Layout.fillWidth: true
+
+                        ComboBox {
+                            Layout.fillWidth: true
+                            model: backend.selectedComparisonOptions
+                            currentIndex: backend.comparisonIndex(
+                                backend.selectedRulePath,
+                                backend.selectedRuleComparison
+                            )
+
+                            onActivated: {
+                                backend.updateSelectedRuleField("comparison", currentText)
+                            }
+                        }
+                    }
+
+                    InspectorField {
+                        labelText: "VALUE"
+                        Layout.fillWidth: true
+
+                        Loader {
+                            Layout.fillWidth: true
+                            sourceComponent: backend.selectedPathType === "boolean"
+                                ? booleanValueEditor
+                                : textValueEditor
+                        }
+
+                        Component {
+                            id: booleanValueEditor
+
+                            ComboBox {
+                                width: parent ? parent.width : 320
+                                model: backend.selectedValueOptions
+                                currentIndex: backend.selectedValueIndex
+
+                                onActivated: {
+                                    backend.updateSelectedRuleField("value", currentText)
+                                }
+                            }
+                        }
+
+                        Component {
+                            id: textValueEditor
+
+                            TextField {
+                                width: parent ? parent.width : 320
+                                text: backend.selectedRuleValue
+                                placeholderText: "32, early_game, leather, etc."
+                                selectByMouse: true
+
+                                onEditingFinished: {
+                                    backend.updateSelectedRuleField("value", text)
+                                }
+                            }
+                        }
+                    }
+
+                    InspectorField {
+                        labelText: "SCORE CHANGE"
+                        Layout.fillWidth: true
+
+                        TextField {
+                            Layout.fillWidth: true
+                            text: backend.selectedRuleScoreChange
+                            placeholderText: "25"
+                            selectByMouse: true
+
+                            onEditingFinished: {
+                                backend.updateSelectedRuleField("score_change", text)
+                            }
+                        }
+                    }
+
+                    InspectorField {
+                        labelText: "REASONING"
+                        Layout.fillWidth: true
+
+                        TextArea {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 76
+                            text: backend.selectedRuleReasoning
+                            placeholderText: "Enough blocks for a basic rush."
+                            wrapMode: TextArea.Wrap
+                            selectByMouse: true
+
+                            onEditingFinished: {
+                                backend.updateSelectedRuleField("reasoning", text)
+                            }
+                        }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        Button {
+                            text: "Delete Rule"
+                            flat: true
+                            Material.foreground: dangerColor
+                            onClicked: backend.deleteSelected()
+                        }
+
+                        Item {
+                            Layout.fillWidth: true
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+"""
+
+
+def main():
+    try:
+        QQuickStyle.setStyle("Material")
+    except Exception:
+        pass
+
+    app = QGuiApplication(sys.argv)
+
+    backend = EditorBackend()
+
+    engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("backend", backend)
+    engine.loadData(QML_SOURCE.encode("utf-8"), QUrl("qrc:/main.qml"))
+
+    if not engine.rootObjects():
+        print("Failed to load the QML interface.")
+        raise SystemExit(1)
+
+    raise SystemExit(app.exec())
 
 
 if __name__ == "__main__":
-    root = make_root_window()
-    app = BWGSActionEditor(root)
-    root.mainloop()
+    main()

@@ -1,0 +1,44 @@
+{
+  "plays": [
+    {
+      "name": "first_rush",
+      "base_score": 0,
+      "rules": [
+        {
+          "path": "active_user.blocks",
+          "comparison": "greater_than_or_equal_to",
+          "value": 32,
+          "score_change": 25,
+          "reasoning": "Enough blocks for a basic rush."
+        },
+        {
+          "path": "teams.green.players_alive",
+          "comparison": "",
+          "value": 2,
+          "score_change": 35,
+          "reasoning": "Push blue team"
+        },
+        {
+          "path": "active_user.has_pickaxe",
+          "comparison": "equal_to",
+          "value": true,
+          "score_change": 50,
+          "reasoning": "New rule reasoning."
+        }
+      ]
+    },
+    {
+      "name": "new_play_2",
+      "base_score": 0,
+      "rules": [
+        {
+          "path": "active_user.sword_type",
+          "comparison": "equal_to",
+          "value": "wood",
+          "score_change": "",
+          "reasoning": ""
+        }
+      ]
+    }
+  ]
+}
